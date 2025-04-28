@@ -1,0 +1,17 @@
+# Archivos de compilación de ESP-IDF
+build/
+*/build/
+
+# Configuración local (usar sdkconfig.defaults si se necesita)
+sdkconfig
+*/sdkconfig
+
+# Archivos del IDE (ejemplos)
+.vscode/
+.idea/
+
+# Otros
+*.bin
+*.elf
+*.map
+*~
