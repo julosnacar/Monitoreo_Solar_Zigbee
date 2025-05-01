@@ -11,7 +11,7 @@
 #include <main.h>
 #include "driver/gpio.h"
 #include "freertos/timers.h"
-#include "led_strip.h" // <--- CAMBIO: Incluir cabecera para LED RGB
+#include "led_strip.h" //LED RGB
 #include "sdkconfig.h"
 
 #define TAG "ZIGBEE_SENSOR_ROUTER"
@@ -20,7 +20,7 @@
 #define ADC_CHANNEL_1 ADC1_CHANNEL_0 // Sensor 1 conectado a GPIO1
 #define ADC_CHANNEL_2 ADC1_CHANNEL_1 // Sensor 2 conectado a GPIO2
 #define ADC_CHANNEL_3 ADC1_CHANNEL_2 // Sensor 3 conectado a GPIO3
-#define ADC_ATTEN ADC_ATTEN_DB_12
+#define ADC_ATTEN ADC_ATTEN_DB_12 
 #define ADC_UNIT ADC_UNIT_1
 #define ADC_WIDTH ADC_WIDTH_BIT_12
 #define ADC_VREF_MV 3300
@@ -110,7 +110,7 @@ static void led_set_rgb(uint8_t r, uint8_t g, uint8_t b) {
     }
 }
 
-// <--- CAMBIO: Apaga el LED
+// Apaga el LED
 static void led_off() {
     if (g_led_strip) {
         led_strip_clear(g_led_strip);
@@ -120,7 +120,7 @@ static void led_off() {
     }
 }
 
-// <--- CAMBIO: Callback del timer adaptado para RGB
+// Callback del timer adaptado para RGB
 static void blink_timer_callback(TimerHandle_t xTimer) {
     // Solo parpadea si estamos en un estado _BLINK
     if (g_led_state == LED_STATE_INIT_BLINK ||
@@ -213,7 +213,7 @@ static void led_set_state(led_state_t new_state) {
 }
 
 
-// --- Funciones ADC (Sin cambios, usan las defines de arriba) ---
+// --- Funciones ADC ---
 static void adc_init()
 {
     ESP_LOGI(TAG, "Inicializando ADC1...");

@@ -20,6 +20,12 @@
 #define ZIGBEE_COORDINATOR_ENDPOINT 1        // Endpoint for the coordinator's application clusters
 #define ZIGBEE_PERMIT_JOIN_DURATION 180      // Allow devices to join for 180 seconds after network formation
 
+// --- Configuración Cluster Personalizado ---
+#define ZIGBEE_CUSTOM_CLUSTER_ID        0xFC01 // ID de Cluster Personalizado
+#define ATTR_ID_CURRENT_SENSOR_1        0x0001 // ID de Atributo para Corriente 1
+#define ATTR_ID_CURRENT_SENSOR_2        0x0002 // ID de Atributo para Corriente 2
+#define ATTR_ID_CURRENT_SENSOR_3        0x0003 // ID de Atributo para Corriente 3
+
 // --- ZCL Attribute Handler ---
 // This function gets called when ZCL commands targeted at this device's endpoints arrive.
 // We are interested in 'Report Attributes' command from the Analog Input cluster.
@@ -30,53 +36,138 @@ esp_err_t esp_zb_zcl_attr_handler(const esp_zb_zcl_cmd_info_t *cmd_info, const v
     }
 
     ESP_LOGD(TAG, "ZCL attribute handler: Cluster=0x%04X, CmdDir=%d, IsCommon=%d, CmdID=0x%02X",
-             cmd_info->cluster, cmd_info->command.direction, cmd_info->command.is_common, cmd_info->command.id);
+            cmd_info->cluster, cmd_info->command.direction, cmd_info->command.is_common, cmd_info->command.id);
 
-    // Check if it's an incoming Report Attributes command
-    if (cmd_info->command.direction == ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV && // Command sent TO our server endpoint
-        cmd_info->command.is_common &&                                   // It's a general ZCL command
-        cmd_info->command.id == 0x0A) {   // The command is Report Attributes
-
-        // Cast the user_data to the report message structure
+    // Verificar si es un comando 'Report Attributes' entrante
+    if (cmd_info->command.direction == ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV &&
+        cmd_info->command.is_common &&
+        cmd_info->command.id == 0x0A) // 0x0A es Report Attributes
+    {
         esp_zb_zcl_report_attr_message_t *report_msg = (esp_zb_zcl_report_attr_message_t *)user_data;
-
-        // Acceder directamente al único atributo en el mensaje
         esp_zb_zcl_attribute_t *reported_attr = &(report_msg->attribute);
 
-        // Verificar si es el atributo que esperamos (Analog Input, PresentValue)
-        if (cmd_info->cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT &&
-            reported_attr->id == ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID &&
-            reported_attr->data.type == ESP_ZB_ZCL_ATTR_TYPE_SINGLE) { // Verificar que sea float
+        uint16_t sender_short_addr = cmd_info->src_address.u.short_addr; // Identificador del sensor
+        uint8_t sender_endpoint = cmd_info->src_endpoint;
 
-            // Extraer el valor float
-            float received_value = *(float *)(reported_attr->data.value);
-            uint16_t sender_short_addr = cmd_info->src_address.u.short_addr; // Identificador del sensor
-            uint8_t sender_endpoint = cmd_info->src_endpoint;
+        // --- CAMBIO: Verificar si es NUESTRO cluster personalizado ---
+        if (cmd_info->cluster == ZIGBEE_CUSTOM_CLUSTER_ID &&
+            reported_attr->data.type == ESP_ZB_ZCL_ATTR_TYPE_SINGLE) // Verificar que sea float
+        {
+            float received_current = *(float *)(reported_attr->data.value);
 
-            // Imprimir el dato recibido
-            ESP_LOGI(TAG, "Dato Recibido del Sensor [Addr: 0x%04X, EP: %d]: Valor Analógico = %.2f",
-                     sender_short_addr, sender_endpoint, received_value);
+            // ---Determinar qué sensor es por el ID del atributo ---
+            const char *sensor_name = "Desconocido";
+            if (reported_attr->id == ATTR_ID_CURRENT_SENSOR_1) {
+                sensor_name = "Sensor 1";
+            } else if (reported_attr->id == ATTR_ID_CURRENT_SENSOR_2) {
+                sensor_name = "Sensor 2";
+            } else if (reported_attr->id == ATTR_ID_CURRENT_SENSOR_3) {
+                sensor_name = "Sensor 3";
+            }
 
-            // --- TODO: lógica adicional ---
-            // - Guardar el dato en una estructura.
-            // - Enviar el dato por Serial/USB a la Raspberry Pi/PC.
-            // - Enviar el dato a AWS u otra plataforma cloud.
-            // -------------------------------------------------
+            // Imprimir el dato recibido específico
+            ESP_LOGI(TAG, "Dato Recibido del Dispositivo [Addr: 0x%04X, EP: %d]: %s = %.3f A",
+                    sender_short_addr, sender_endpoint, sensor_name, received_current);
+
+            // --- Lógica para recolectar los 3 valores y enviar a AWS ---
+            // Aquí necesitarías una estructura o diccionario (similar al script Python)
+            // para almacenar temporalmente las lecturas de cada sensor (identificado por sender_short_addr)
+            // hasta que tengas las 3, y luego enviar el conjunto completo.
+            // Ejemplo MUY básico (no maneja múltiples sensores simultáneamente) TOMADO DOCUMENTACION:
+            /*
+            static float currents[3] = {NAN, NAN, NAN}; // Usar NAN de math.h si es posible
+            static uint8_t received_mask = 0;
+            int sensor_index = -1;
+
+            if (reported_attr->id == ATTR_ID_CURRENT_SENSOR_1) sensor_index = 0;
+            else if (reported_attr->id == ATTR_ID_CURRENT_SENSOR_2) sensor_index = 1;
+            else if (reported_attr->id == ATTR_ID_CURRENT_SENSOR_3) sensor_index = 2;
+
+            if (sensor_index != -1) {
+                currents[sensor_index] = received_current;
+                received_mask |= (1 << sensor_index);
+            }
+
+            if (received_mask == 0b111) { // Si tenemos los 3 bits (lecturas)
+                ESP_LOGI(TAG, "¡Lecturas completas del sensor 0x%04X! S1=%.3f, S2=%.3f, S3=%.3f",
+                         sender_short_addr, currents[0], currents[1], currents[2]);
+                // ¡¡AQUÍ LLAMARÍAS A LA FUNCIÓN PARA ENVIAR A AWS/RASPBERRY PI!!
+                // Por ejemplo: send_data_to_host(sender_short_addr, currents[0], currents[1], currents[2]);
+                received_mask = 0; // Resetear para el próximo conjunto
+                // currents[0] = currents[1] = currents[2] = NAN; // Limpiar opcionalmente
+            }
+            */
+            // ------------------------------------------------------------------
 
         } else {
-            // Loguear si se recibe un reporte de otro atributo/cluster
             ESP_LOGD(TAG, "Reporte de atributo recibido pero no procesado: Cluster 0x%04X, Atributo 0x%04X",
-                     cmd_info->cluster, reported_attr->id);
+                    cmd_info->cluster, reported_attr->id);
         }
     } else {
-        // Log other ZCL commands received if needed
         ESP_LOGD(TAG, "Comando ZCL no manejado recibido: Cluster 0x%04X, Comando 0x%02X, Dirección %d",
-                 cmd_info->cluster, cmd_info->command.id, cmd_info->command.direction);
+                cmd_info->cluster, cmd_info->command.id, cmd_info->command.direction);
     }
-    return ESP_OK; // Indicate the command was handled (or ignored intentionally)
+    return ESP_OK;
 }
 
+// --- Callback Principal de Acciones Zigbee Core ---
+esp_err_t esp_zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
+{
+    esp_err_t ret = ESP_OK;
 
+    switch (callback_id) {
+        case ESP_ZB_CORE_CMD_REPORT_CONFIG_RESP_CB_ID:
+            // Manejar respuestas de configuración de reportes si es necesario
+            ESP_LOGI(TAG, "Recibida respuesta de Config Report");
+            break;
+
+        case ESP_ZB_CORE_REPORT_ATTR_CB_ID: // <--- ¡Este es el evento para reportes de atributos!
+        {
+            esp_zb_zcl_report_attr_message_t *report_message = (esp_zb_zcl_report_attr_message_t *)message;
+            ESP_LOGD(TAG, "Recibido reporte de atributo desde 0x%04x (EP %d), Cluster 0x%04x, Attr 0x%04x",
+                     report_message->src_address.u.short_addr, report_message->src_endpoint,
+                     report_message->cluster, report_message->attribute.id);
+
+            // Crear una estructura cmd_info simulada para pasar a tu handler original
+            // (Esto es una adaptación, podrías refactorizar esp_zb_zcl_attr_handler para aceptar directamente report_message)
+            esp_zb_zcl_cmd_info_t cmd_info;
+            memset(&cmd_info, 0, sizeof(esp_zb_zcl_cmd_info_t)); // Inicializar a cero
+
+            // Llenar los campos necesarios para tu handler
+            cmd_info.status = report_message->status; // Usar el status del mensaje de reporte
+            cmd_info.src_address = report_message->src_address;
+            cmd_info.dst_endpoint = report_message->dst_endpoint; // El endpoint de nuestro coordinador
+            cmd_info.src_endpoint = report_message->src_endpoint;
+            cmd_info.cluster = report_message->cluster;
+            cmd_info.profile = ESP_ZB_AF_HA_PROFILE_ID; // Asumir perfil HA
+            // Simular un comando de reporte entrante
+            cmd_info.command.id = 0x0A; // Report Attributes ID
+            cmd_info.command.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV; // Viniendo hacia nuestro servidor
+            cmd_info.command.is_common = true; // Es un comando común
+
+            // Llamar a manejador específico
+            ret = esp_zb_zcl_attr_handler(&cmd_info, (void*)report_message);
+
+            break;
+        }
+
+        case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
+            // Manejar notificaciones locales de cambio de atributo si es necesario
+            ESP_LOGI(TAG, "Atributo local actualizado");
+            break;
+
+        // Añadir más casos para otros eventos que necesites manejar (ej. Identify, Scenes, etc.)
+        // case ESP_ZB_CORE_IDENTIFY_EFFECT_CB_ID:
+        //    ...
+        //    break;
+
+        default:
+            ESP_LOGW(TAG, "Callback de acción no manejado: ID=0x%04x", callback_id);
+            ret = ESP_FAIL; // O ESP_OK si quieres ignorar silenciosamente
+            break;
+    }
+    return ret;
+}
 // --- Zigbee Stack Signal Handler ---
 // Handles events like network formation, device joining, etc.
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
@@ -184,12 +275,19 @@ static void esp_zb_task(void *pvParameters) {
     ESP_RETURN_ON_FALSE(identify_cluster, , TAG, "Fallo al crear clúster Identify");
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
-    // Analog Input Cluster (Client) - To receive reports from sensors
+    // -- Cluster Personalizado (Cliente) para recibir datos del sensor ---
+    esp_zb_attribute_list_t *custom_cluster_client = esp_zb_zcl_attr_list_create(ZIGBEE_CUSTOM_CLUSTER_ID);
+    ESP_RETURN_ON_FALSE(custom_cluster_client, , TAG, "Fallo al crear lista atributos Custom Client");
+    // No se necesitan atributos específicos en el lado cliente para solo recibir reportes
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(cluster_list, custom_cluster_client, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
+    ESP_LOGI(TAG, "Añadido Cluster Custom (ID: 0x%04X) como Cliente.", ZIGBEE_CUSTOM_CLUSTER_ID);
+    
+    /*// Analog Input Cluster (Client) - To receive reports from sensors
     esp_zb_attribute_list_t *analog_input_client_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT);
     ESP_RETURN_ON_FALSE(analog_input_client_cluster, , TAG, "Fallo al crear lista atributos Analog Input Client");
     // No attributes needed for client side usually, unless you want to store reporting config locally
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_input_cluster(cluster_list, analog_input_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
-    ESP_LOGI(TAG, "Clústeres definidos: Basic(S), Identify(S), AnalogInput(C)");
+    ESP_LOGI(TAG, "Clústeres definidos: Basic(S), Identify(S), AnalogInput(C)");*/
 
     // 4. Define Endpoint for the Coordinator
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
@@ -208,8 +306,8 @@ static void esp_zb_task(void *pvParameters) {
     ESP_LOGI(TAG, "Dispositivo Coordinador registrado.");
 
     // 6. Register the ZCL attribute handler callback
-    //ESP_ERROR_CHECK(esp_zb_zcl_register_attr_handler(esp_zb_zcl_attr_handler));
-    //ESP_LOGI(TAG, "Manejador de atributos ZCL registrado.");
+    esp_zb_core_action_handler_register(esp_zb_action_handler);
+    ESP_LOGI(TAG, "Manejador de atributos ZCL registrado.");
 
     // 7. Set the channel mask (optional but recommended for coordinators)
     ESP_ERROR_CHECK(esp_zb_set_primary_network_channel_set(ZIGBEE_CHANNEL_MASK));
@@ -254,9 +352,9 @@ void app_main(void) {
     ESP_LOGI(TAG, "--- Iniciando Coordinador Zigbee ---");
 
     // Set Zigbee log level
-    esp_log_level_set("Zigbee", ESP_LOG_INFO); // Adjust log level as needed (INFO, DEBUG, etc.)
+    esp_log_level_set("Zigbee", ESP_LOG_INFO);
 
-    // Initialize platform (NVS, Zigbee radio/host config)
+    // (NVS, Zigbee radio/host config)
     zigbee_platform_init();
 
     // Create and start the main Zigbee task
