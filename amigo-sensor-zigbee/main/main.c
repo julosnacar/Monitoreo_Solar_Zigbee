@@ -41,10 +41,10 @@
 #define ATTR_ID_CURRENT_SENSOR_3        0x0003
 
 // --- Configuración LED RGB ---
-#define RGB_LED_GPIO 8//CONFIG_BLINK_GPIO // <--- CAMBIO: Usar GPIO de menuconfig o definir uno aquí (ej: GPIO_NUM_X)
-#define BLINK_PERIOD_MS 1000          // Periodo de parpadeo total (500ms ON, 500ms OFF)
+#define RGB_LED_GPIO 8//CONFIG_BLINK_GPIO
+#define BLINK_PERIOD_MS 1000// Periodo de parpadeo total (500ms ON, 500ms OFF)
 
-// <--- CAMBIO: Enum para los estados del LED RGB
+//Enum para los estados del LED RGB
 typedef enum {
     LED_STATE_OFF = 0,            // Estado inicial o apagado explícito
     LED_STATE_INIT_BLINK,         // Amarillo parpadeante (Stack iniciado, antes de buscar)
@@ -61,15 +61,15 @@ typedef struct {
     uint8_t b;
 } rgb_color_t;
 
-// <--- CAMBIO: Definición de colores para cada estado (valores bajos para no saturar)
+//Definición de colores para cada estado (valores bajos para no saturar)
 const rgb_color_t COLOR_OFF      = {0, 0, 0};//16, 0, 0 --> verde 0, 16, 0 --> rojo 0, 0, 16 --> azul
 const rgb_color_t COLOR_YELLOW   = {16, 16, 0}; // Amarillo
 const rgb_color_t COLOR_BLUE     = {0, 0, 16};  // Azul tenue
-const rgb_color_t COLOR_ORANGE   = {255, 16, 0};  // Naranja
+const rgb_color_t COLOR_ORANGE   = {255, 16, 0}; // Naranja
 const rgb_color_t COLOR_GREEN    = {16, 0, 0};  // Verde
 const rgb_color_t COLOR_RED      = {0, 16, 0};  // Rojo
 
-static led_strip_handle_t g_led_strip = NULL; // <--- CAMBIO: Handle para el LED strip
+static led_strip_handle_t g_led_strip = NULL; //Handle para el LED strip
 static led_state_t g_led_state = LED_STATE_OFF;
 static TimerHandle_t blink_timer = NULL;
 static bool g_led_physical_state_on = false; // Indica si el LED está físicamente encendido (true) o apagado (false) en el ciclo de parpadeo
@@ -80,7 +80,7 @@ static SemaphoreHandle_t xZigbeeNetworkReadySemaphore = NULL;
 
 // --- Funciones LED RGB ---
 
-// <--- CAMBIO: Inicializa el LED RGB usando led_strip
+//Inicializa el LED RGB usando led_strip
 static void led_init() {
     ESP_LOGI(TAG, "Configurando LED RGB en GPIO%d", RGB_LED_GPIO);
     led_strip_config_t strip_config = {
@@ -101,7 +101,7 @@ static void led_init() {
     }
 }
 
-// <--- CAMBIO: Enciende el LED con un color específico
+// Enciende el LED con un color específico
 static void led_set_rgb(uint8_t r, uint8_t g, uint8_t b) {
     if (g_led_strip) {
         led_strip_set_pixel(g_led_strip, 0, r, g, b);
