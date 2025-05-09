@@ -18,3 +18,4 @@ sdkconfig
 
 # Ignorar la carpeta SONOFF_Dongle dentro de Para_Windows
 Para_Windows/SONOFF_Dongle/
+Para_Windows/.EFR32MG21/

@@ -1,3 +1,4 @@
+#--- START OF FILE sensor_gateway_ezsp.py ---
 import asyncio
 import logging
 import signal
@@ -9,7 +10,7 @@ import sys
 import serial
 import serial.tools.list_ports
 
-# --- Importaciones Zigpy y ZNP ---
+# --- Importaciones Zigpy y Bellows (para EZSP) ---
 from zigpy.application import ControllerApplication
 import zigpy.config as zigpy_config
 import zigpy.endpoint
@@ -20,21 +21,20 @@ import zigpy.zcl.foundation as zcl_f
 import zigpy.device
 
 try:
-    import zigpy_znp.zigbee.application
-    import zigpy_znp.config as znp_config
+    import bellows.ezsp # Para verificar que bellows está disponible
+    import bellows.config as bellows_config # Para configuraciones específicas de bellows/EZSP
+    import bellows.zigbee.application as bellows_app # Para la aplicación de Zigbee de bellows
     RADIO_LIBRARIES_AVAILABLE = True
 except ImportError:
     RADIO_LIBRARIES_AVAILABLE = False
-    print("Advertencia: Biblioteca zigpy-znp no instalada. Instalar con: pip install zigpy-znp")
+    print("Advertencia: Biblioteca 'bellows' no instalada. Instalar con: pip install bellows")
 
 # --- Configuración ---
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger(__name__)
 
-# SERIAL_PORT será detectado automáticamente.
-# En Raspberry Pi, los puertos suelen ser /dev/ttyUSB0, /dev/ttyACM0, etc.
-BAUD_RATE = 115200
-DATABASE_PATH = 'zigbee.db' # Considera una ruta absoluta si lo ejecutas como servicio, ej: '/home/pi/project-zigbee/zigbee.db'
+BAUD_RATE = 115200 # ZBDongle-E usa 115200 baudios por defecto
+DATABASE_PATH = 'zigbee.db'
 AWS_API_ENDPOINT = 'https://lbbcoc4xnd.execute-api.ap-southeast-2.amazonaws.com/dev/reading/save'
 
 # --- Constantes del Cluster Personalizado ---
@@ -145,12 +145,11 @@ def check_and_send_data(device):
     else:
         _LOGGER.debug("check_and_send_data: Faltan atributos para %s. Datos actuales: %s", dev_ieee, cached_data)
 
-# --- MODIFICADO: Detección de puerto para Linux (Raspberry Pi) ---
 def find_sonoff_dongle_port():
-    """Intenta encontrar el puerto serie del Sonoff Dongle automáticamente."""
-    # VID y PID típicos para el puente CP210x (usado en ZBDongle-E y P)
-    SONOFF_VID = 0x10C4
-    SONOFF_PID = 0xEA60
+    """Intenta encontrar el puerto serie del Sonoff ZBDongle-E automáticamente."""
+    # VID y PID típicos para el puente CP210x (usado en ZBDongle-E y P si este último usa CP210x)
+    CP210X_VID = 0x10C4
+    CP210X_PID = 0xEA60
 
     ports = serial.tools.list_ports.comports()
     _LOGGER.info("Buscando puertos serie disponibles...")
@@ -162,78 +161,83 @@ def find_sonoff_dongle_port():
             f"Puerto detectado: {port.device} - {port.description} "
             f"[VID:{vid_str} PID:{pid_str} SER:{port.serial_number} HWID:{port.hwid}]"
         )
-        # En Linux, VID y PID pueden ser None si el usuario no tiene permisos para acceder a toda la info de USB.
-        # A menudo, la descripción es más útil en Linux si VID/PID fallan.
-        if port.vid == SONOFF_VID and port.pid == SONOFF_PID:
-            _LOGGER.info(f"Dongle Sonoff (CP210x/CP2102N) encontrado por VID/PID en: {port.device} (Descripción: {port.description})")
+        if port.vid == CP210X_VID and port.pid == CP210X_PID:
+            _LOGGER.info(f"Dongle con chip CP210x (como Sonoff ZBDongle-E) encontrado por VID/PID en: {port.device} (Descripción: {port.description})")
             sonoff_port = port.device
-            break
-        # Fallback a la descripción si VID/PID no están disponibles o no coinciden (más robusto en Linux)
-        elif "CP210x" in port.description or "Silicon Labs CP210x" in port.description:
-             _LOGGER.info(f"Dongle Sonoff (CP210x/CP2102N) encontrado por descripción en: {port.device} (Descripción: {port.description})")
-             if sonoff_port is None: # Solo tomar si no se encontró por VID/PID
+            break # Encontrado el más probable por VID/PID
+        elif port.description and ("CP210x" in port.description or "Silicon Labs CP210x" in port.description):
+             _LOGGER.info(f"Posible Dongle con chip CP210x encontrado por descripción en: {port.device} (Descripción: {port.description})")
+             if not sonoff_port: # Tomar si no se ha encontrado uno mejor
                  sonoff_port = port.device
-                 # No hacemos break aquí para dar prioridad a la detección por VID/PID si aparece después
+        # Podríamos añadir aquí detección para TI si se quisiera un script más genérico,
+        # pero como este es para EZSP/bellows, nos centramos en CP210x.
 
     if sonoff_port:
-        # --- Asegurar permisos en Linux ---
-        # Esto no cambia el permiso permanentemente, solo es una nota.
-        # El usuario necesita ser parte del grupo 'dialout' o usar udev rules.
-        _LOGGER.info(f"Puerto seleccionado: {sonoff_port}. Asegúrate de tener permisos de lectura/escritura.")
+        _LOGGER.info(f"Puerto seleccionado para EZSP (bellows): {sonoff_port}. Asegúrate de tener permisos de lectura/escritura.")
         _LOGGER.info("En Linux, añade tu usuario al grupo 'dialout': sudo usermod -a -G dialout $USER")
-        _LOGGER.info("Y reinicia la sesión o el sistema. O usa 'sudo python sensor_gateway.py' (no recomendado para largo plazo).")
+        _LOGGER.info("Y reinicia la sesión o el sistema. O usa 'sudo python ...' (no recomendado para largo plazo).")
         return sonoff_port
     else:
-        _LOGGER.error("No se pudo encontrar automáticamente un dongle Sonoff Zigbee compatible.")
-        _LOGGER.warning("Asegúrate de que el dongle (modelo ZBDongle-E o ZBDongle-P) esté conectado,")
-        _LOGGER.warning("y que no esté siendo utilizado por otra aplicación (ej. Zigbee2MQTT, ZHA).")
+        _LOGGER.error("No se pudo encontrar automáticamente un dongle Zigbee con chip CP210x (como Sonoff ZBDongle-E).")
+        _LOGGER.warning("Asegúrate de que el dongle ZBDongle-E esté conectado y no esté siendo utilizado por otra aplicación.")
+        _LOGGER.warning("Si estás usando un Sonoff ZBDongle-P (chip TI), necesitas usar la biblioteca 'zigpy-znp' y un script adaptado para ella.")
         _LOGGER.warning("Puertos listados:")
-        for port in ports:
-            _LOGGER.warning(f"  - {port.device}: {port.description}")
+        for p in ports:
+            _LOGGER.warning(f"  - {p.device}: {p.description} [VID:{p.vid:04X if p.vid else 'N/A'} PID:{p.pid:04X if p.pid else 'N/A'}]")
         return None
-# --- FIN DE MODIFICACIÓN ---
 
 async def main():
     global app
 
     if not RADIO_LIBRARIES_AVAILABLE:
-        _LOGGER.error("La biblioteca de radio requerida (zigpy-znp) no está instalada. Por favor, instálala primero.")
+        _LOGGER.error("La biblioteca de radio requerida ('bellows') no está instalada. Por favor, instálala primero con 'pip install bellows'.")
         return
 
-    logging.getLogger('zigpy_znp').setLevel(logging.DEBUG) # Para más detalles si hay problemas
+    # Habilitar logs de depuración para las bibliotecas clave
+    logging.getLogger('bellows').setLevel(logging.DEBUG)
+    logging.getLogger('bellows.uart').setLevel(logging.DEBUG) # Para ver la comunicación serial cruda
+    logging.getLogger('bellows.ezsp').setLevel(logging.DEBUG) # Para el protocolo EZSP
     logging.getLogger('zigpy.application').setLevel(logging.DEBUG)
-
 
     SERIAL_PORT = find_sonoff_dongle_port()
     if not SERIAL_PORT:
-        _LOGGER.error("No se pudo determinar el puerto del dongle Zigbee. Abortando.")
+        _LOGGER.error("No se pudo determinar el puerto del dongle Zigbee EZSP. Abortando.")
         return
-    _LOGGER.info(f"Usando el puerto serie detectado: {SERIAL_PORT}")
+    _LOGGER.info(f"Usando el puerto serie detectado para EZSP: {SERIAL_PORT}")
 
-    # Configuración para zigpy-znp
-    # Para el ZBDongle-E, prueba con rtscts=True si el firmware lo espera,
-    # o sin él si causa problemas.
-    znp_device_config = {
+    # --- CONFIGURACIÓN PARA BELLOWS (EZSP) ---
+    device_config_ezsp = {
+        # bellows_config.CONF_DEVICE_PATH es la forma "oficial" pero una cadena también funciona.
+        # Usaremos la cadena para consistencia con cómo se manejan otras claves.
         'path': SERIAL_PORT,
         'baudrate': BAUD_RATE,
-        # 'rtscts': True, # Descomenta si tu firmware flasheado lo requiere y los DIPs (si los tuviera) están ON
-                         # Para el ZBDongle-E sin DIPs, prueba sin esto primero.
+        # Para ZBDongle-E (EZSP), el control de flujo por hardware es CRUCIAL.
+        # Bellows espera 'hardware', 'software', o None.
+        'flow_control': 'hardware', # RTS/CTS
     }
 
     app_config = {
         zigpy_config.CONF_DATABASE: DATABASE_PATH,
-        zigpy_config.CONF_DEVICE: znp_device_config,
+        zigpy_config.CONF_DEVICE: device_config_ezsp, # Aquí va la config específica del radio
+        # zigpy_config.CONF_DEVICE_TYPE: 'ezsp', # No es estrictamente necesario, zigpy lo infiere
+                                                 # si bellows está instalado y configurado.
     }
+    # --- FIN DE CONFIGURACIÓN PARA BELLOWS ---
 
-    _LOGGER.info("Intentando crear la aplicación del controlador...")
-    _LOGGER.debug(f"Configuración de la aplicación para zigpy-znp: {app_config}")
+    _LOGGER.info("Intentando crear la aplicación del controlador (bellows para EZSP)...")
+    _LOGGER.debug(f"Configuración de la aplicación para EZSP (bellows): {json.dumps(app_config, default=str)}")
+
+    # **RECOMENDACIÓN:** Antes de cada intento, especialmente después de un fallo,
+    # elimina manualmente el archivo 'zigbee.db'.
+    _LOGGER.info(f"Asegúrate de que el archivo '{DATABASE_PATH}' se elimine si estás solucionando problemas de inicio.")
 
     try:
-        app = await zigpy_znp.zigbee.application.ControllerApplication.new(
+        # Usar la clase ControllerApplication de bellows.zigbee.application
+        app = await bellows_app.ControllerApplication.new(
             config=app_config,
-            auto_form=True
+            auto_form=True # Intentará formar una red si no existe o restaurar desde DB
         )
-        _LOGGER.info("Instancia de ControllerApplication (zigpy-znp) creada exitosamente.")
+        _LOGGER.info("Instancia de ControllerApplication (EZSP/bellows) creada exitosamente.")
 
         listener = ZigbeeListener()
         app.add_listener(listener)
@@ -242,72 +246,82 @@ async def main():
         await app.startup(auto_form=True)
         _LOGGER.info("Controlador Zigbee iniciado exitosamente. Esperando dispositivos y datos...")
 
-        # Mantener el script corriendo
-        # En un escenario real, podrías tener aquí un loop que haga otras tareas
-        # o simplemente esperar a ser interrumpido.
         stop_event = asyncio.Event()
-        # Configurar manejadores de señales para llamar a stop_event.set()
         loop = asyncio.get_running_loop()
-        
-        # --- MODIFICADO: Manejo de señales para asyncio.Event ---
-        signals_to_handle = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT) # SIGHUP puede no estar en Windows, pero sí en RPi
+
+        signals_to_handle = [signal.SIGTERM, signal.SIGINT]
+        if hasattr(signal, 'SIGHUP'): # SIGHUP no existe en Windows
+            signals_to_handle.append(signal.SIGHUP)
+
         for sig in signals_to_handle:
             try:
-                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(signal_handler(s, stop_event)))
+                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(signal_handler_async(s, stop_event)))
             except (NotImplementedError, AttributeError, RuntimeError):
                  _LOGGER.warning(f"No se pudo registrar el manejador para la señal {sig.name}. Puede no estar disponible en este SO.")
-        # --- FIN DE MODIFICACIÓN ---
 
         await stop_event.wait()
 
     except serial.SerialException as se:
         _LOGGER.error(f"Error del puerto serial: {se}")
         _LOGGER.error(f"No se puede comunicar con el adaptador Zigbee en {SERIAL_PORT}.")
-        _LOGGER.error("Verifica las conexiones y permisos (ej. ser miembro del grupo 'dialout').")
-    except Exception as radio_init_error:
-        _LOGGER.error(f"Error de inicialización de radio o configuración: {radio_init_error}", exc_info=True)
+        _LOGGER.error("Verifica las conexiones y permisos (ej. ser miembro del grupo 'dialout' en Linux).")
+    except Exception as radio_init_error: # Captura más genérica para otros errores de bellows/zigpy
+        _LOGGER.error(f"Error de inicialización de radio o configuración (EZSP/bellows): {radio_init_error}", exc_info=True)
         _LOGGER.error("Esto puede indicar un problema de comunicación con el adaptador Zigbee,")
         _LOGGER.error(f"un problema con el firmware del dongle ({SERIAL_PORT}),")
-        _LOGGER.error("o un error en la configuración de zigpy-znp.")
-        _LOGGER.debug(f"app_config utilizada: {app_config}")
+        _LOGGER.error("o un error en la configuración de bellows.")
+        _LOGGER.debug(f"app_config utilizada: {json.dumps(app_config, default=str)}")
     finally:
         _LOGGER.info("Iniciando proceso de cierre de la aplicación del controlador Zigbee...")
         if app and hasattr(app, 'shutdown'):
             try:
+                # ControllerApplication general de zigpy usa app.state
                 if hasattr(app, 'state') and app.state == zigpy.application.ControllerApplication.State.RUNNING:
                     _LOGGER.info("Llamando a app.shutdown()...")
                     await app.shutdown()
                     _LOGGER.info("app.shutdown() completado.")
                 else:
-                    _LOGGER.info("La aplicación no estaba en estado RUNNING o ya se cerró, omitiendo shutdown.")
+                    _LOGGER.info(f"La aplicación no estaba en estado RUNNING (estado actual: {app.state if hasattr(app, 'state') else 'desconocido'}) o ya se cerró, omitiendo shutdown explícito aquí.")
             except Exception as e_shutdown:
                 _LOGGER.exception("Error durante app.shutdown(): %s", e_shutdown)
+        elif app:
+            _LOGGER.warning("La instancia 'app' existe pero no parece tener método shutdown o estado adecuado.")
+        else:
+            _LOGGER.info("La instancia de la aplicación ('app') no fue creada o asignada exitosamente.")
         _LOGGER.info("Proceso de cierre finalizado.")
 
-# --- MODIFICADO: Rutina de manejo de señal para asyncio.Event ---
-async def signal_handler(sig, stop_event):
+async def signal_handler_async(sig, stop_event):
     _LOGGER.info("Recibida señal de salida %s. Iniciando cierre...", sig.name)
-    # No necesitamos llamar a app.shutdown() aquí, se hará en el finally de main()
-    # cuando stop_event.wait() se desbloquee.
-    # Simplemente activamos el evento para que main() pueda salir de su espera.
     if not stop_event.is_set():
         stop_event.set()
-# --- FIN DE MODIFICACIÓN ---
-
-
-# --- MODIFICADO: El antiguo 'shutdown' ahora es parte del flujo de 'main' y 'signal_handler' ---
-# El código de manejo de señales y el loop de eventos se simplifica usando asyncio.run()
 
 if __name__ == "__main__":
-    if not RADIO_LIBRARIES_AVAILABLE: # Chequeo temprano
+    if not RADIO_LIBRARIES_AVAILABLE:
+        sys.exit(1)
+
+    # Verificar dependencias de pyserial
+    try:
+        if 'serial' not in sys.modules:
+            print("Error: módulo pyserial no encontrado. Instalar con: pip install pyserial")
+            sys.exit(1)
+        try:
+            if not hasattr(serial.tools.list_ports, 'comports'):
+                raise ImportError("serial.tools.list_ports.comports no encontrado.")
+        except ImportError:
+            print("Error: serial.tools.list_ports.comports no encontrado. Asegúrate de tener pyserial >= 2.6.")
+            print("Instalar o actualizar con: pip install --upgrade pyserial")
+            sys.exit(1)
+    except Exception as dep_check_error:
+        _LOGGER.error(f"Error durante la verificación de dependencias: {dep_check_error}")
         sys.exit(1)
 
     try:
-        # Para Python 3.7+ se recomienda asyncio.run()
         asyncio.run(main())
     except KeyboardInterrupt:
-        _LOGGER.info("KeyboardInterrupt (Ctrl+C) recibido. El cierre es manejado por la señal SIGINT.")
+        _LOGGER.info("KeyboardInterrupt (Ctrl+C) recibido. El cierre es manejado por la señal SIGINT o el finally de main.")
     except Exception as e:
-        _LOGGER.exception("Excepción no controlada en el nivel superior: %s", e)
+        _LOGGER.exception("Excepción no controlada en el nivel superior del script: %s", e)
     finally:
-        _LOGGER.info("Programa finalizado.")
+        _LOGGER.info("Programa finalizado desde el bloque __main__.")
+
+#--- END OF FILE sensor_gateway_ezsp.py ---
