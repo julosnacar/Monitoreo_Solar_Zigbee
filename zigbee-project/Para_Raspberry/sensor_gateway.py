@@ -1,327 +1,300 @@
-#--- START OF FILE sensor_gateway_ezsp.py ---
 import asyncio
 import logging
+import random
 import signal
-import json
-import requests
-from datetime import datetime, timedelta
-import time
-import sys
-import serial
-import serial.tools.list_ports
-
-# --- Importaciones Zigpy y Bellows (para EZSP) ---
-from zigpy.application import ControllerApplication
-import zigpy.config as zigpy_config
-import zigpy.endpoint
-import zigpy.profiles
-import zigpy.types
-import zigpy.zcl
-import zigpy.zcl.foundation as zcl_f
-import zigpy.device
-
-try:
-    import bellows.ezsp # Para verificar que bellows está disponible
-    import bellows.config as bellows_config # Para configuraciones específicas de bellows/EZSP
-    import bellows.zigbee.application as bellows_app # Para la aplicación de Zigbee de bellows
-    RADIO_LIBRARIES_AVAILABLE = True
-except ImportError:
-    RADIO_LIBRARIES_AVAILABLE = False
-    print("Advertencia: Biblioteca 'bellows' no instalada. Instalar con: pip install bellows")
+from typing import Dict, Any
 
 # --- Configuración ---
-logging.basicConfig(level=logging.INFO)
-_LOGGER = logging.getLogger(__name__)
+DEVICE_PATH = '/dev/ttyUSB0'
+BAUDRATE = 115200
+FLOW_CONTROL = None
+PERMIT_JOIN_DURATION_ON_STARTUP = 180
 
-BAUD_RATE = 115200 # ZBDongle-E usa 115200 baudios por defecto
-DATABASE_PATH = 'zigbee.db'
-AWS_API_ENDPOINT = 'https://lbbcoc4xnd.execute-api.ap-southeast-2.amazonaws.com/dev/reading/save'
-
-# --- Constantes del Cluster Personalizado ---
+ESP32_H2_ENDPOINT_ID = 1
 CUSTOM_CLUSTER_ID = 0xFC01
 ATTR_ID_CURRENT_SENSOR_1 = 0x0001
 ATTR_ID_CURRENT_SENSOR_2 = 0x0002
 ATTR_ID_CURRENT_SENSOR_3 = 0x0003
 
-# --- Estado Global ---
-app = None
-sensor_data_cache = {}
-last_send_time = {}
-SEND_INTERVAL_SECONDS = 5
+REPORTING_MIN_INTERVAL = 10
+REPORTING_MAX_INTERVAL = 60
+REPORTABLE_CURRENT_CHANGE = 0.05
 
-class ZigbeeListener:
-    def device_joined(self, device):
-        _LOGGER.info("Dispositivo unido: %s", device)
-        if device.ieee not in sensor_data_cache:
-            sensor_data_cache[device.ieee] = {}
-        if device.ieee not in last_send_time:
-            last_send_time[device.ieee] = datetime.min
+import zigpy.config as zigpy_config
+import zigpy.exceptions
+import zigpy.device as zigpy_dev
+import zigpy.endpoint as zigpy_ep
+import zigpy.zcl.foundation as zcl_f
+from zigpy.zcl import Cluster
+import zigpy.types as t
 
-    def device_left(self, device):
-        _LOGGER.info("Dispositivo abandonó: %s", device)
-        if device.ieee in sensor_data_cache:
-            del sensor_data_cache[device.ieee]
-        if device.ieee in last_send_time:
-            del last_send_time[device.ieee]
+try:
+    from bellows.zigbee.application import ControllerApplication as BellowsApplication
+except ImportError:
+    print("Error: La biblioteca 'bellows' no está instalada.")
+    BellowsApplication = None
 
-    def device_removed(self, device):
-        _LOGGER.info("Dispositivo eliminado: %s", device)
-        if device.ieee in sensor_data_cache:
-            del sensor_data_cache[device.ieee]
-        if device.ieee in last_send_time:
-            del last_send_time[device.ieee]
-
-    def attribute_updated(self, device, profile_id, cluster_id, endpoint_id, attrid, value):
-        _LOGGER.debug(
-            "Actualización de atributo recibida de %s (Endpoint: %d): Cluster: 0x%04x, Atributo: 0x%04x, Valor: %s",
-            device.ieee, endpoint_id, cluster_id, attrid, value
-        )
-
-        if cluster_id == CUSTOM_CLUSTER_ID:
-            if attrid in [ATTR_ID_CURRENT_SENSOR_1, ATTR_ID_CURRENT_SENSOR_2, ATTR_ID_CURRENT_SENSOR_3]:
-                if device.ieee not in sensor_data_cache:
-                    sensor_data_cache[device.ieee] = {}
-                if device.ieee not in last_send_time:
-                    last_send_time[device.ieee] = datetime.min
-                try:
-                    float_value = float(value)
-                    _LOGGER.info(
-                        "Dato de corriente recibido de %s: Attr 0x%04x = %.3f A",
-                        device.ieee, attrid, float_value
-                    )
-                    sensor_data_cache[device.ieee][attrid] = float_value
-                    check_and_send_data(device)
-                except ValueError:
-                    _LOGGER.warning(
-                        "Valor no numérico recibido de %s: Attr 0x%04x = %s",
-                        device.ieee, attrid, value
-                    )
-
-def send_to_aws(device_ieee, data):
-    global last_send_time
-    payload = {
-        "sensor_mac": str(device_ieee),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "current_1": data.get(ATTR_ID_CURRENT_SENSOR_1, None),
-        "current_2": data.get(ATTR_ID_CURRENT_SENSOR_2, None),
-        "current_3": data.get(ATTR_ID_CURRENT_SENSOR_3, None)
+class CustomPowerSensorCluster(Cluster):
+    cluster_id = CUSTOM_CLUSTER_ID
+    attributes = {
+        ATTR_ID_CURRENT_SENSOR_1: ("current_sensor_1", t.Single),
+        ATTR_ID_CURRENT_SENSOR_2: ("current_sensor_2", t.Single),
+        ATTR_ID_CURRENT_SENSOR_3: ("current_sensor_3", t.Single),
     }
-    payload_clean = {k: v for k, v in payload.items() if v is not None}
-    _LOGGER.info("Preparando para enviar a AWS: %s", json.dumps(payload_clean))
-    headers = {'Content-Type': 'application/json'}
-    try:
-        response = requests.post(AWS_API_ENDPOINT, headers=headers, json=payload_clean, timeout=10)
-        response.raise_for_status()
-        _LOGGER.info("Datos enviados a AWS exitosamente para %s (Status: %d)", device_ieee, response.status_code)
-        last_send_time[device_ieee] = datetime.utcnow()
-    except requests.exceptions.Timeout:
-        _LOGGER.error("Error de Timeout al enviar datos a AWS para %s", device_ieee)
-    except requests.exceptions.HTTPError as http_err:
-        _LOGGER.error("Error HTTP al enviar datos a AWS para %s: %s - Respuesta: %s", device_ieee, http_err, response.text)
-    except requests.exceptions.RequestException as e:
-        _LOGGER.error("Error de Red/Conexión al enviar datos a AWS para %s: %s", device_ieee, e)
-    except Exception as e:
-        _LOGGER.error("Error inesperado durante envío a AWS para %s: %s", device_ieee, e)
 
-def check_and_send_data(device):
-    global sensor_data_cache, last_send_time, SEND_INTERVAL_SECONDS
-    dev_ieee = device.ieee
-    if dev_ieee not in sensor_data_cache:
-        _LOGGER.debug("check_and_send_data: Dispositivo %s no encontrado en caché.", dev_ieee)
-        return
-    cached_data = sensor_data_cache[dev_ieee]
-    if (ATTR_ID_CURRENT_SENSOR_1 in cached_data and
-            ATTR_ID_CURRENT_SENSOR_2 in cached_data and
-            ATTR_ID_CURRENT_SENSOR_3 in cached_data):
-        _LOGGER.debug("check_and_send_data: Los 3 atributos recibidos para %s.", dev_ieee)
-        now = datetime.utcnow()
-        last_sent = last_send_time.get(dev_ieee, datetime.min)
-        time_since_last_send = now - last_sent
-        if time_since_last_send >= timedelta(seconds=SEND_INTERVAL_SECONDS):
-            _LOGGER.info("check_and_send_data: Intervalo cumplido para %s. Enviando datos.", dev_ieee)
-            send_to_aws(dev_ieee, cached_data)
-        else:
-            _LOGGER.debug("check_and_send_data: Aún no ha pasado el intervalo para %s. Esperando.", dev_ieee)
-    else:
-        _LOGGER.debug("check_and_send_data: Faltan atributos para %s. Datos actuales: %s", dev_ieee, cached_data)
-
-def find_sonoff_dongle_port():
-    """Intenta encontrar el puerto serie del Sonoff ZBDongle-E automáticamente."""
-    # VID y PID típicos para el puente CP210x (usado en ZBDongle-E y P si este último usa CP210x)
-    CP210X_VID = 0x10C4
-    CP210X_PID = 0xEA60
-
-    ports = serial.tools.list_ports.comports()
-    _LOGGER.info("Buscando puertos serie disponibles...")
-    sonoff_port = None
-    for port in ports:
-        vid_str = f"{port.vid:04X}" if port.vid is not None else "N/A"
-        pid_str = f"{port.pid:04X}" if port.pid is not None else "N/A"
-        _LOGGER.debug(
-            f"Puerto detectado: {port.device} - {port.description} "
-            f"[VID:{vid_str} PID:{pid_str} SER:{port.serial_number} HWID:{port.hwid}]"
+if CUSTOM_CLUSTER_ID not in Cluster._registry:
+     Cluster._registry[CUSTOM_CLUSTER_ID] = CustomPowerSensorCluster
+else:
+    if Cluster._registry[CUSTOM_CLUSTER_ID] is not CustomPowerSensorCluster:
+        logging.warning(
+            f"Cluster ID {CUSTOM_CLUSTER_ID:#06x} ya estaba en Cluster.registry "
+            f"pero con una clase diferente ({Cluster._registry[CUSTOM_CLUSTER_ID].__name__}). "
+            f"Sobrescribiendo con CustomPowerSensorCluster."
         )
-        if port.vid == CP210X_VID and port.pid == CP210X_PID:
-            _LOGGER.info(f"Dongle con chip CP210x (como Sonoff ZBDongle-E) encontrado por VID/PID en: {port.device} (Descripción: {port.description})")
-            sonoff_port = port.device
-            break # Encontrado el más probable por VID/PID
-        elif port.description and ("CP210x" in port.description or "Silicon Labs CP210x" in port.description):
-             _LOGGER.info(f"Posible Dongle con chip CP210x encontrado por descripción en: {port.device} (Descripción: {port.description})")
-             if not sonoff_port: # Tomar si no se ha encontrado uno mejor
-                 sonoff_port = port.device
-        # Podríamos añadir aquí detección para TI si se quisiera un script más genérico,
-        # pero como este es para EZSP/bellows, nos centramos en CP210x.
-
-    if sonoff_port:
-        _LOGGER.info(f"Puerto seleccionado para EZSP (bellows): {sonoff_port}. Asegúrate de tener permisos de lectura/escritura.")
-        _LOGGER.info("En Linux, añade tu usuario al grupo 'dialout': sudo usermod -a -G dialout $USER")
-        _LOGGER.info("Y reinicia la sesión o el sistema. O usa 'sudo python ...' (no recomendado para largo plazo).")
-        return sonoff_port
+        Cluster._registry[CUSTOM_CLUSTER_ID] = CustomPowerSensorCluster
     else:
-        _LOGGER.error("No se pudo encontrar automáticamente un dongle Zigbee con chip CP210x (como Sonoff ZBDongle-E).")
-        _LOGGER.warning("Asegúrate de que el dongle ZBDongle-E esté conectado y no esté siendo utilizado por otra aplicación.")
-        _LOGGER.warning("Si estás usando un Sonoff ZBDongle-P (chip TI), necesitas usar la biblioteca 'zigpy-znp' y un script adaptado para ella.")
-        _LOGGER.warning("Puertos listados:")
-        for p in ports:
-            _LOGGER.warning(f"  - {p.device}: {p.description} [VID:{p.vid:04X if p.vid else 'N/A'} PID:{p.pid:04X if p.pid else 'N/A'}]")
-        return None
+        logging.info(f"Cluster ID {CUSTOM_CLUSTER_ID:#06x} (CustomPowerSensorCluster) ya estaba en Cluster.registry.")
+
+shutdown_event = asyncio.Event()
+
+class SensorAttributeListener:
+    def __init__(self, device_ieee: t.EUI64):
+        self.device_ieee = device_ieee
+        self._last_values: Dict[int, float] = {}
+
+    def attribute_updated(self, cluster: Cluster, attribute_id: int, value: Any, timestamp):
+        print(f"DEBUG: Se recibió una actualización para cluster {cluster.cluster_id:#06x}, atributo {attribute_id:#06x}, valor {value}")
+        if cluster.endpoint.device.ieee != self.device_ieee or cluster.cluster_id != CUSTOM_CLUSTER_ID:
+            return
+
+        self._last_values[attribute_id] = value
+        sensor_name = "Desconocido"
+        if attribute_id == ATTR_ID_CURRENT_SENSOR_1:
+            sensor_name = "Sensor Corriente 1"
+        elif attribute_id == ATTR_ID_CURRENT_SENSOR_2:
+            sensor_name = "Sensor Corriente 2"
+        elif attribute_id == ATTR_ID_CURRENT_SENSOR_3:
+            sensor_name = "Sensor Corriente 3"
+
+        # Usar print en lugar de logging para asegurar que se vea
+        print(f"*** LECTURA DE SENSOR: {sensor_name} (AttrID: {attribute_id:#06x}) = {value:.2f} A ***")
+        logging.info(f"ACTUALIZACIÓN SENSOR ({cluster.endpoint.device.nwk:#06x}): "
+                     f"{sensor_name} (AttrID: {attribute_id:#06x}) = {value:.2f} A")
+
+
+class MyEventListener:
+    def __init__(self, app_controller):
+        self._app = app_controller
+        self._sensor_listeners: Dict[t.EUI64, SensorAttributeListener] = {}
+
+    def device_joined(self, device: zigpy_dev.Device):
+        logging.info(f"DISPOSITIVO UNIDO (info básica): {device.nwk:#06x} / {device.ieee}")
+
+    def raw_device_initialized(self, device: zigpy_dev.Device):
+        logging.info(f"DISPOSITIVO RAW INICIALIZADO (endpoints leídos): {device.nwk:#06x} / {device.ieee}")
+
+    async def configure_device_reporting(self, device: zigpy_dev.Device):
+        if ESP32_H2_ENDPOINT_ID not in device.endpoints:
+            logging.warning(f"Dispositivo {device.ieee} no tiene el endpoint {ESP32_H2_ENDPOINT_ID}")
+            return
+
+        endpoint = device.endpoints[ESP32_H2_ENDPOINT_ID]
+
+        if CUSTOM_CLUSTER_ID not in endpoint.in_clusters:
+            logging.error(
+                f"Dispositivo {device.ieee} NO TIENE el cluster custom {CUSTOM_CLUSTER_ID:#06x} "
+                f"en el endpoint {ESP32_H2_ENDPOINT_ID} después de la inicialización. "
+                f"Clusters en input: {list(endpoint.in_clusters.keys())}"
+            )
+            return
+        
+        custom_cluster = endpoint.in_clusters[CUSTOM_CLUSTER_ID]
+        if not isinstance(custom_cluster, CustomPowerSensorCluster):
+            logging.error(f"Cluster {CUSTOM_CLUSTER_ID:#06x} en {device.ieee} no es del tipo CustomPowerSensorCluster esperado. "
+                          f"Tipo actual: {type(custom_cluster)}. El registro del cluster puede haber fallado o sido sobrescrito.")
+            return
+
+        attributes_to_configure = {
+            ATTR_ID_CURRENT_SENSOR_1: "Corriente Sensor 1",
+            ATTR_ID_CURRENT_SENSOR_2: "Corriente Sensor 2",
+            ATTR_ID_CURRENT_SENSOR_3: "Corriente Sensor 3",
+        }
+
+        logging.info(f"Configurando reporte de atributos para {device.ieee} en cluster {custom_cluster!r}...")
+        for attr_id, attr_name in attributes_to_configure.items():
+            try:
+                if not custom_cluster.find_attribute(attr_id):
+                    logging.error(f"  Atributo {attr_id:#06x} ({attr_name}) NO ENCONTRADO en la definición de CustomPowerSensorCluster.")
+                    continue
+
+                
+                response_tuple = await custom_cluster.configure_reporting(
+                    attr_id,
+                    REPORTING_MIN_INTERVAL,
+                    REPORTING_MAX_INTERVAL,
+                    REPORTABLE_CURRENT_CHANGE,
+                )
+                
+                if response_tuple and len(response_tuple) == 2:
+                    # res_header = response_tuple[0] # No la usamos directamente aquí
+                    res_payload_args = response_tuple[1]
+
+                    if hasattr(res_payload_args, 'status_records') and res_payload_args.status_records:
+                        all_attr_successful = True
+                        for record in res_payload_args.status_records:
+                            if record.status != zcl_f.Status.SUCCESS:
+                                all_attr_successful = False
+                                logging.error(
+                                    f"  Fallo al configurar reporte para {attr_name} (AttrID: {attr_id:#06x}) "
+                                    f"en registro específico: Status={record.status.name}, AttrID={record.attrid}, Direction={record.direction}"
+                                )
+                        
+                        if all_attr_successful:
+                            if len(res_payload_args.status_records) == 1 and res_payload_args.status_records[0].attrid is None:
+                                logging.info(f"  Configurado reporte para {attr_name} (AttrID: {attr_id:#06x}) exitosamente (respuesta SUCCESS global).")
+                            else:
+                                logging.info(f"  Configurado reporte para {attr_name} (AttrID: {attr_id:#06x}) con registros de estado específicos: {res_payload_args.status_records}")
+                    else:
+                        logging.warning(f"  Respuesta sin status_records para {attr_name} (AttrID: {attr_id:#06x}): PAYLOAD_ARGS={res_payload_args}")
+                elif response_tuple is None:
+                    logging.error(f"  No se recibió respuesta (None) al configurar reporte para {attr_name} (AttrID: {attr_id:#06x}). Timeout o no se esperaba respuesta?")
+                else:
+                    logging.warning(f"  Respuesta con formato diferente al esperado para {attr_name} (AttrID: {attr_id:#06x}): {response_tuple}")
+
+            except ValueError as ve:
+                logging.error(f"  ValueError (posiblemente atributo desconocido internamente por zigpy) al configurar reporte para {attr_name} (AttrID: {attr_id:#06x}): {ve}")
+            except Exception as e:
+                logging.error(f"  Excepción general al configurar reporte para {attr_name} (AttrID: {attr_id:#06x}): {type(e).__name__} - {e}", exc_info=True) # Poner True para traceback completo
+        
+        if device.ieee not in self._sensor_listeners:
+            sensor_listener = SensorAttributeListener(device.ieee)
+            custom_cluster.add_listener(sensor_listener)
+            self._sensor_listeners[device.ieee] = sensor_listener
+            logging.info(f"Listener de atributos añadido para el cluster custom de {device.ieee}")
+
+    def device_initialized(self, device: zigpy_dev.Device):
+        logging.info(f"DISPOSITIVO COMPLETAMENTE INICIALIZADO: {device}")
+        if device.nwk != 0x0000: # No configurar el propio coordinador
+            # Crear una tarea para no bloquear el callback del listener
+            asyncio.create_task(self.configure_device_reporting(device))
+
+    def device_left(self, device: zigpy_dev.Device):
+        logging.info(f"DISPOSITIVO ABANDONÓ LA RED: {device}")
+        if device.ieee in self._sensor_listeners and ESP32_H2_ENDPOINT_ID in device.endpoints:
+            endpoint = device.endpoints[ESP32_H2_ENDPOINT_ID]
+            if CUSTOM_CLUSTER_ID in endpoint.in_clusters:
+                custom_cluster = endpoint.in_clusters[CUSTOM_CLUSTER_ID]
+                try:
+                    # Verificar si el listener está realmente en la lista antes de intentar removerlo
+                    # El acceso a _listeners es interno, pero para un listener que nosotros añadimos, debería estar bien.
+                    if hasattr(custom_cluster, '_listeners') and \
+                       self._sensor_listeners[device.ieee] in custom_cluster._listeners.values():
+                        custom_cluster.remove_listener(self._sensor_listeners[device.ieee])
+                except Exception as e: 
+                    logging.warning(f"Error al remover listener de {custom_cluster}: {e}")
+            del self._sensor_listeners[device.ieee]
+            logging.info(f"Listener de atributos removido para {device.ieee}")
+
+
+    def connection_lost(self, exc: Exception):
+        logging.error(f"CONEXIÓN PERDIDA con el coordinador: {exc}")
+        logging.info("Intentando detener la aplicación debido a la pérdida de conexión...")
+        if not shutdown_event.is_set():
+            shutdown_event.set()
 
 async def main():
-    global app
-
-    if not RADIO_LIBRARIES_AVAILABLE:
-        _LOGGER.error("La biblioteca de radio requerida ('bellows') no está instalada. Por favor, instálala primero con 'pip install bellows'.")
-        return
-
-    # Habilitar logs de depuración para las bibliotecas clave
-    logging.getLogger('bellows').setLevel(logging.DEBUG)
-    logging.getLogger('bellows.uart').setLevel(logging.DEBUG) # Para ver la comunicación serial cruda
-    logging.getLogger('bellows.ezsp').setLevel(logging.DEBUG) # Para el protocolo EZSP
-    logging.getLogger('zigpy.application').setLevel(logging.DEBUG)
-
-    SERIAL_PORT = find_sonoff_dongle_port()
-    if not SERIAL_PORT:
-        _LOGGER.error("No se pudo determinar el puerto del dongle Zigbee EZSP. Abortando.")
-        return
-    _LOGGER.info(f"Usando el puerto serie detectado para EZSP: {SERIAL_PORT}")
-
-    # --- CONFIGURACIÓN PARA BELLOWS (EZSP) ---
-    device_config_ezsp = {
-        # bellows_config.CONF_DEVICE_PATH es la forma "oficial" pero una cadena también funciona.
-        # Usaremos la cadena para consistencia con cómo se manejan otras claves.
-        'path': SERIAL_PORT,
-        'baudrate': BAUD_RATE,
-        # Para ZBDongle-E (EZSP), el control de flujo por hardware es CRUCIAL.
-        # Bellows espera 'hardware', 'software', o None.
-        'flow_control': 'hardware', # RTS/CTS
-    }
-
-    app_config = {
-        zigpy_config.CONF_DATABASE: DATABASE_PATH,
-        zigpy_config.CONF_DEVICE: device_config_ezsp, # Aquí va la config específica del radio
-        # zigpy_config.CONF_DEVICE_TYPE: 'ezsp', # No es estrictamente necesario, zigpy lo infiere
-                                                 # si bellows está instalado y configurado.
-    }
-    # --- FIN DE CONFIGURACIÓN PARA BELLOWS ---
-
-    _LOGGER.info("Intentando crear la aplicación del controlador (bellows para EZSP)...")
-    _LOGGER.debug(f"Configuración de la aplicación para EZSP (bellows): {json.dumps(app_config, default=str)}")
-
-    # **RECOMENDACIÓN:** Antes de cada intento, especialmente después de un fallo,
-    # elimina manualmente el archivo 'zigbee.db'.
-    _LOGGER.info(f"Asegúrate de que el archivo '{DATABASE_PATH}' se elimine si estás solucionando problemas de inicio.")
-
+    if BellowsApplication is None: return
+    log_format = "%(asctime)s %(levelname)s [%(name)s] [%(module)s:%(lineno)d] %(funcName)s: %(message)s"
+    logging.getLogger().setLevel(logging.DEBUG)  # Cambiar de INFO a DEBUG
+    logging.basicConfig(level=logging.INFO, format=log_format)
+    print(f"Intentando conectar al coordinador en: {DEVICE_PATH} a {BAUDRATE} baudios con control de flujo: {FLOW_CONTROL}.")
+    app = None
     try:
-        # Usar la clase ControllerApplication de bellows.zigbee.application
-        app = await bellows_app.ControllerApplication.new(
-            config=app_config,
-            auto_form=True # Intentará formar una red si no existe o restaurar desde DB
-        )
-        _LOGGER.info("Instancia de ControllerApplication (EZSP/bellows) creada exitosamente.")
-
-        listener = ZigbeeListener()
+        bellows_specific_config = { zigpy_config.CONF_DEVICE_PATH: DEVICE_PATH, zigpy_config.CONF_DEVICE_BAUDRATE: BAUDRATE, }
+        if FLOW_CONTROL is not None: bellows_specific_config[zigpy_config.CONF_DEVICE_FLOW_CONTROL] = FLOW_CONTROL
+        network_config = {}
+        zigpy_general_config = { zigpy_config.CONF_DATABASE: "zigbee.db", zigpy_config.CONF_NWK_BACKUP_ENABLED: True, zigpy_config.CONF_NWK: network_config, zigpy_config.CONF_OTA: { zigpy_config.CONF_OTA_ENABLED: False, zigpy_config.CONF_OTA_PROVIDERS: [], } }
+        config_para_schema = { zigpy_config.CONF_DEVICE: bellows_specific_config, **zigpy_general_config }
+        final_app_config = BellowsApplication.SCHEMA(config_para_schema)
+        app = BellowsApplication(config=final_app_config)
+        listener = MyEventListener(app_controller=app)
         app.add_listener(listener)
-
-        _LOGGER.info("Iniciando la aplicación del controlador Zigbee (startup)...")
-        await app.startup(auto_form=True)
-        _LOGGER.info("Controlador Zigbee iniciado exitosamente. Esperando dispositivos y datos...")
-
-        stop_event = asyncio.Event()
-        loop = asyncio.get_running_loop()
-
-        signals_to_handle = [signal.SIGTERM, signal.SIGINT]
-        if hasattr(signal, 'SIGHUP'): # SIGHUP no existe en Windows
-            signals_to_handle.append(signal.SIGHUP)
-
-        for sig in signals_to_handle:
-            try:
-                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(signal_handler_async(s, stop_event)))
-            except (NotImplementedError, AttributeError, RuntimeError):
-                 _LOGGER.warning(f"No se pudo registrar el manejador para la señal {sig.name}. Puede no estar disponible en este SO.")
-
-        await stop_event.wait()
-
-    except serial.SerialException as se:
-        _LOGGER.error(f"Error del puerto serial: {se}")
-        _LOGGER.error(f"No se puede comunicar con el adaptador Zigbee en {SERIAL_PORT}.")
-        _LOGGER.error("Verifica las conexiones y permisos (ej. ser miembro del grupo 'dialout' en Linux).")
-    except Exception as radio_init_error: # Captura más genérica para otros errores de bellows/zigpy
-        _LOGGER.error(f"Error de inicialización de radio o configuración (EZSP/bellows): {radio_init_error}", exc_info=True)
-        _LOGGER.error("Esto puede indicar un problema de comunicación con el adaptador Zigbee,")
-        _LOGGER.error(f"un problema con el firmware del dongle ({SERIAL_PORT}),")
-        _LOGGER.error("o un error en la configuración de bellows.")
-        _LOGGER.debug(f"app_config utilizada: {json.dumps(app_config, default=str)}")
+        print("Iniciando aplicación del controlador Zigbee...")
+        try:
+            await app.startup(auto_form=False)
+            print("Aplicación iniciada. Red ya estaba formada o fue cargada de la BD/dongle.")
+        except zigpy.exceptions.NetworkNotFormed:
+            print("La red no está formada. Intentando formar una nueva red...")
+            await app.form_network()
+            print("Nueva red formada. Reiniciando la aplicación para usar la nueva red...")
+            await app.shutdown(db=False)
+            app = BellowsApplication(config=final_app_config)
+            app.add_listener(listener)
+            await app.startup(auto_form=False)
+            print("Aplicación reiniciada con la nueva red formada.")
+        print("¡Controlador Zigbee listo y operando!")
+        node_info = app.state.node_info
+        network_info = app.state.network_info
+        if node_info: print(f"  Coordinador IEEE: {node_info.ieee}, NWK: 0x{node_info.nwk:04x}")
+        if network_info: print(f"  Red EPID: {network_info.extended_pan_id}, PAN ID: 0x{network_info.pan_id:04x}, Canal: {network_info.channel}")
+        if PERMIT_JOIN_DURATION_ON_STARTUP > 0:
+            print(f"\nAbriendo la red para uniones durante {PERMIT_JOIN_DURATION_ON_STARTUP} segundos...")
+            await app.permit(PERMIT_JOIN_DURATION_ON_STARTUP)
+            print(f"La red está abierta para uniones. Se cerrará automáticamente en {PERMIT_JOIN_DURATION_ON_STARTUP}s.")
+        else: print("\nLa red NO se abrirá automáticamente para uniones al inicio.")
+        print("\nLa aplicación Zigbee está en funcionamiento. Presiona Ctrl+C para detener.")
+        await shutdown_event.wait()
+    except KeyboardInterrupt:
+        logging.info("\nInterrupción por teclado detectada. Iniciando cierre...")
+        if not shutdown_event.is_set(): shutdown_event.set()
+    except Exception as e:
+        logging.error(f"Error general en la aplicación: {type(e).__name__}: {e}", exc_info=True)
+        if not shutdown_event.is_set(): shutdown_event.set()
     finally:
-        _LOGGER.info("Iniciando proceso de cierre de la aplicación del controlador Zigbee...")
-        if app and hasattr(app, 'shutdown'):
+        pending_tasks_in_finally = []
+        if app is not None:
+            logging.info("\nIniciando proceso de cierre de la aplicación Zigbee...")
+            connection_ezsp_active = False
+            if hasattr(app, '_ezsp') and app._ezsp is not None:
+                try:
+                    if app._ezsp.is_connected: connection_ezsp_active = True
+                except AttributeError: logging.warning("app._ezsp.is_connected no encontrado durante el cierre.")
+                except Exception as e_check_conn: logging.warning(f"Error al verificar app._ezsp.is_connected: {e_check_conn}")
+            if connection_ezsp_active:
+                try:
+                    logging.info("Cerrando permiso de unión (permit(0))...")
+                    await app.permit(0)
+                except Exception as e_permit: logging.warning(f"No se pudo cerrar el permiso de unión durante el cierre: {e_permit}")
+            else: logging.info("La conexión EZSP no parece activa, omitiendo app.permit(0) explícito.")
             try:
-                # ControllerApplication general de zigpy usa app.state
-                if hasattr(app, 'state') and app.state == zigpy.application.ControllerApplication.State.RUNNING:
-                    _LOGGER.info("Llamando a app.shutdown()...")
-                    await app.shutdown()
-                    _LOGGER.info("app.shutdown() completado.")
-                else:
-                    _LOGGER.info(f"La aplicación no estaba en estado RUNNING (estado actual: {app.state if hasattr(app, 'state') else 'desconocido'}) o ya se cerró, omitiendo shutdown explícito aquí.")
-            except Exception as e_shutdown:
-                _LOGGER.exception("Error durante app.shutdown(): %s", e_shutdown)
-        elif app:
-            _LOGGER.warning("La instancia 'app' existe pero no parece tener método shutdown o estado adecuado.")
-        else:
-            _LOGGER.info("La instancia de la aplicación ('app') no fue creada o asignada exitosamente.")
-        _LOGGER.info("Proceso de cierre finalizado.")
+                loop = asyncio.get_running_loop()
+                if loop.is_running():
+                    current_main_task = asyncio.current_task(loop=loop)
+                    for task in asyncio.all_tasks(loop=loop):
+                        if task is not current_main_task and not task.done(): pending_tasks_in_finally.append(task)
+            except RuntimeError: logging.warning("No se pudo obtener el bucle de eventos en finally para cancelar tareas.")
+            if pending_tasks_in_finally:
+                logging.info(f"Cancelando {len(pending_tasks_in_finally)} tareas pendientes antes de app.shutdown()...")
+                for task in pending_tasks_in_finally: task.cancel()
+                try:
+                    await asyncio.gather(*pending_tasks_in_finally, return_exceptions=True)
+                    logging.info("Cancelación de tareas pendientes (o finalización) completada.")
+                except Exception as e_gather: logging.warning(f"Error durante gather de tareas canceladas: {e_gather}")
+            else: logging.info("No hay tareas pendientes activas para cancelar.")
+            logging.info("Llamando a app.shutdown()...")
+            try:
+                await app.shutdown()
+                logging.info("Proceso de cierre del controlador completado.")
+            except Exception as e_shutdown: logging.error(f"Error durante app.shutdown(): {type(e_shutdown).__name__}: {e_shutdown}", exc_info=True)
+        else: logging.info("\nLa instancia de la aplicación no fue creada o la conexión inicial falló.")
+        logging.info("Fin del script.")
 
-async def signal_handler_async(sig, stop_event):
-    _LOGGER.info("Recibida señal de salida %s. Iniciando cierre...", sig.name)
-    if not stop_event.is_set():
-        stop_event.set()
+def signal_handler(sig, frame):
+    logging.info(f"Señal {signal.Signals(sig).name} recibida, estableciendo evento de cierre...")
+    if not shutdown_event.is_set(): shutdown_event.set()
+    else: logging.warning("Evento de cierre ya establecido. Múltiples señales de interrupción recibidas.")
 
 if __name__ == "__main__":
-    if not RADIO_LIBRARIES_AVAILABLE:
-        sys.exit(1)
-
-    # Verificar dependencias de pyserial
-    try:
-        if 'serial' not in sys.modules:
-            print("Error: módulo pyserial no encontrado. Instalar con: pip install pyserial")
-            sys.exit(1)
-        try:
-            if not hasattr(serial.tools.list_ports, 'comports'):
-                raise ImportError("serial.tools.list_ports.comports no encontrado.")
-        except ImportError:
-            print("Error: serial.tools.list_ports.comports no encontrado. Asegúrate de tener pyserial >= 2.6.")
-            print("Instalar o actualizar con: pip install --upgrade pyserial")
-            sys.exit(1)
-    except Exception as dep_check_error:
-        _LOGGER.error(f"Error durante la verificación de dependencias: {dep_check_error}")
-        sys.exit(1)
-
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        _LOGGER.info("KeyboardInterrupt (Ctrl+C) recibido. El cierre es manejado por la señal SIGINT o el finally de main.")
-    except Exception as e:
-        _LOGGER.exception("Excepción no controlada en el nivel superior del script: %s", e)
-    finally:
-        _LOGGER.info("Programa finalizado desde el bloque __main__.")
-
-#--- END OF FILE sensor_gateway_ezsp.py ---
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    asyncio.run(main())
