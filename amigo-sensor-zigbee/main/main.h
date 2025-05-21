@@ -5,6 +5,7 @@
 #include "zdo/esp_zigbee_zdo_common.h" // Para definiciones de señales como ESP_ZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT
 #include "zcl/esp_zigbee_zcl_common.h"    // Funciones comunes ZCL como set_attribute_val
 #include "zcl/esp_zigbee_zcl_basic.h"     // IDs de atributos del Cluster Basic
+
 // ------------------------------
 /* Basic manufacturer information */
 //#define ESP_MANUFACTURER_NAME_STR "\x09""ESPRESSIF\0"
