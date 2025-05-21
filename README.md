@@ -39,16 +39,6 @@ El sistema se compone de dos partes principales:
         *   `sdkconfig`: Archivo de configuración del proyecto ESP-IDF (define características del hardware, componentes del SDK, etc.).
         *   `partitions.csv` (Si existe): Define la tabla de particiones de la flash del ESP32.
 
-*   `zigbee-project/`
-    *   **Descripción:** _(Por favor, describe qué contiene esta carpeta si decides mantenerla. Si es un proyecto de ejemplo o una versión anterior, indícalo. Si es redundante, considera eliminarla para mayor claridad)._
-    *   **Contenido Clave:** _(Lista los archivos importantes aquí)_
-
-*   `.gitignore`
-    *   **Descripción:** Especifica los archivos y directorios que Git debe ignorar y no incluir en el control de versiones (ej. archivos de compilación, entornos virtuales).
-
-*   `README.md`
-    *   **Descripción:** Este archivo, proporcionando una visión general del proyecto.
-
 ## Requisitos Previos
 
 ### Para el Dispositivo Sensor/Router ESP32-H2:
@@ -57,7 +47,7 @@ El sistema se compone de dos partes principales:
     *   Sensores de corriente analógicos (ej. HSTS016L).
     *   LED RGB (si se usa la indicación visual).
 *   Software:
-    *   ESP-IDF (Espressif IoT Development Framework) versión X.Y.Z (especifica la versión que usaste, ej. v5.1).
+    *   ESP-IDF (Espressif IoT Development Framework) versión 5.4.1
     *   Toolchain de compilación para ESP32.
 
 ### Para el Coordinador Zigbee Python:
